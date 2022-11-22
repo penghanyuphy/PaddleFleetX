@@ -22,21 +22,28 @@ import paddle.nn as nn
 import paddle.distributed as dist
 import paddle.distributed.fleet as fleet
 from paddle.optimizer.lr import LRScheduler
-
+from paddle.distributed.sharding import group_sharded_parallel
 from paddle.fluid.dygraph.parallel import sync_params_buffers
 from paddle.distributed.fleet.utils.hybrid_parallel_util import fused_allreduce_gradients
 from paddle.profiler import SummaryView
-from paddle.distributed.fleet.meta_parallel import TensorParallel
 
-from ppfleetx.distributed.apis import env, sharding
 from ppfleetx.optims import build_lr_scheduler, build_optimizer
-from ppfleetx.utils.log import logger, get_timestamp, convert_timestamp_to_data
-from ppfleetx.core.engine import BasicEngine, InferenceEngine, TensorRTConfig
+from ppfleetx.utils.log import logger
+from ppfleetx.core.engine import BasicEngine, InferenceEngine
 from ppfleetx.core.module import BasicModule
 from ppfleetx.utils.tensor_fusion_helper import all_reduce_parameters
 from ppfleetx.utils.version import version_check
 from ppfleetx.utils.export import export_inference_model
-from paddle.incubate.distributed.utils.io import save_for_auto_inference
+
+import nvidia_smi
+  
+nvidia_smi.nvmlInit()
+
+handle = nvidia_smi.nvmlDeviceGetHandleByIndex(6)
+# card id 0 hardcoded here, there is also a call to get all available card ids, so we could iterate
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class EagerEngine(BasicEngine):
@@ -149,7 +156,7 @@ class EagerEngine(BasicEngine):
         self._mp_degree = self._dist_configs['mp_degree']
         self._pp_degree = self._dist_configs['pp_degree']
         sharding_config = self._dist_configs['sharding']
-
+        
         self._sharding_stage = sharding_config['sharding_stage']
         self._sharding_degree = sharding_config['sharding_degree']
         self._sharding_offload = sharding_config['sharding_offload']
@@ -157,8 +164,6 @@ class EagerEngine(BasicEngine):
         self._broadcast_overlap = sharding_config['broadcast_overlap']
 
         self._use_recompute = configs['Model']['use_recompute']
-        self._quant_mode = True if 'Quantization' in configs and configs[
-            'Quantization']['enable'] else False
 
         if self._use_pure_fp16:
             if mode == 'train':
@@ -172,22 +177,19 @@ class EagerEngine(BasicEngine):
         else:
             self._scaler = None
 
-        self._lr_scheduler_mode = configs.Optimizer.lr.pop('run_mode', 'step')
-        assert self._lr_scheduler_mode in [
-            'epoch', 'step'
-        ], 'lr.run_mode must be epoch or step'
         self._lr_scheduler = build_lr_scheduler(
             configs.Optimizer.lr) if mode == 'train' else None
 
+        
         self._optimizer = build_optimizer(
             configs.Optimizer, self._module.model,
             self._lr_scheduler) if mode == 'train' else None
 
         # distributed configs
         self._distributed = (dist.get_world_size() > 1)
-
+        '''
         if self._distributed:
-            self._hcg = env.get_hcg()
+            self._hcg = fleet.get_hybrid_communicate_group()
             self._dp_group = self._hcg.get_data_parallel_group()
             self._sharding_group = self._hcg.get_sharding_parallel_group()
 
@@ -196,9 +198,12 @@ class EagerEngine(BasicEngine):
             self._pp_rank = self._hcg.get_stage_id()
             self._sharding_rank = self._hcg.get_sharding_parallel_rank()
 
-            self._wrap_with_fleet()
+            if self._hcg.nranks > 1:
+                self._wrap_with_fleet()
         else:
             self._dp_rank = 0
+        '''
+        self._dp_rank = 0
 
         # using for save/load
         self._load_recovery = {'step': 0, 'epoch': 0, 'rng_state': -1}
@@ -233,37 +238,33 @@ class EagerEngine(BasicEngine):
 
     def _wrap_with_fleet(self):
         if self._sharding_stage in [2, 3]:
-            assert self._pp_degree == 1, "sharding stage2/3 will support pipeline parallel later"
+            assert self._mp_degree == self._pp_degree == 1, "sharding stage2/3 will support hybrid parallel later"
             self._wrap_sharding_2_3()
         else:
             self._wrap_3D_parallel()
 
     def _wrap_sharding_2_3(self):
-        if self._dp_degree > 1 and self._sharding_stage == 3:
+        if self._dp_degree > 1:
             sync_params_buffers(
                 self._module.model,
                 comm_group=self._dp_group,
                 src_rank=self._dp_group.ranks[0])
 
-        if self._mp_degree > 1:
-            assert self._sharding_stage == 2, "only support mp + sharding stage2 hybrid parallel now."
-            self._module.model =  TensorParallel(self._module.model, self._hcg, strategy=None)
-
         level = "p_g_os" if self._sharding_stage == 3 else "os_g"
         origin_model = self._module.model
-        self._module.model, self._optimizer, self._scaler = sharding.sharding_wrapper(
+        self._module.model, self._optimizer, self._scaler = group_sharded_parallel(
             model=self._module.model,
             optimizer=self._optimizer,
             level=level,
             scaler=self._scaler,
             group=self._sharding_group,
-            offload=self._sharding_offload,
-            dp_group=self._dp_group if self._dp_group.nranks > 1 else None)
+            offload=self._sharding_offload)
         if self._reduce_overlap:
             self._module.model._set_reduce_overlap(self._reduce_overlap)
         if self._broadcast_overlap:
-            self._optimizer._set_broadcast_overlap(
-                self._broadcast_overlap, layers=origin_model, num_groups=2)
+            self._optimizer._set_broadcast_overlap(self._broadcast_overlap,
+                                                   layers=origin_model,
+                                                   num_groups=2)
 
     def _wrap_3D_parallel(self):
         self._module.model = fleet.distributed_model(self._module.model)
@@ -275,11 +276,10 @@ class EagerEngine(BasicEngine):
                          epoch_index,
                          train_data_loader=None,
                          valid_data_loader=None):
-        self._module.model.train()
 
         # time count
         train_losses = []
-        train_step_start = get_timestamp()
+        train_start = time.time()
         skip_first = True
         # Note(GuoxiaWang): Do not use len(train_data_loader()),
         # it will cause a memory leak.
@@ -294,35 +294,34 @@ class EagerEngine(BasicEngine):
 
             loss = self._fit_impl(batch)
             train_losses.append(loss)
-
             if (step + 1) % self._logging_freq == 0:
-                train_step_cost = get_timestamp() - train_step_start
+                # Sync for profile time, delete it may be a little faster
+                paddle.device.cuda.synchronize()
+                train_costs = time.time() - train_start
                 numpy_losses = [loss.numpy()[0] for loss in train_losses]
                 log_dict = {
                     'epoch': epoch_index,
                     'total_epoch': self._num_train_epochs,
                     'batch': step,
                     'total_batch': total_train_batch,
-                    'train_cost': train_step_cost
-                    if step == 0 else train_step_cost / self._logging_freq,
+                    'train_cost': train_costs
+                    if step == 0 else train_costs / self._logging_freq,
                     'loss': sum(numpy_losses) / len(numpy_losses),
                     'lr': self._optimizer.get_lr()
                 }
+                # if paddle.distributed.get_rank() == 1:
                 self._module.training_step_end(log_dict)
 
-                train_step_start = get_timestamp()
+                train_start = time.time()
                 train_losses = []
-
-            if self._lr_scheduler is not None and self._lr_scheduler_mode == 'step':
-                self._lr_scheduler.step()
-
-            self._optimizer.clear_grad()
 
             if self._run_mode == 'step' and not skip_first:
                 if self._eval_freq > 0 and step % self._eval_freq == 0:
+                    paddle.device.cuda.synchronize()
+                    self._module.model.eval()
 
                     eval_losses = []
-                    eval_step_start = get_timestamp()
+                    eval_start = time.time()
 
                     for eval_step, batch in enumerate(valid_data_loader):
                         loss = self._evaluate_impl(batch)
@@ -331,7 +330,8 @@ class EagerEngine(BasicEngine):
                         if eval_step >= self._eval_iters - 1:
                             break
 
-                    eval_step_cost = get_timestamp() - eval_step_start
+                    paddle.device.cuda.synchronize()
+                    eval_cost = time.time() - eval_start
                     eval_loss = sum(eval_losses) / len(eval_losses)
 
                     log_dict = {
@@ -339,17 +339,21 @@ class EagerEngine(BasicEngine):
                         'epoch': epoch_index,
                         'batch': eval_step,
                         'total_batch': total_eval_batch,
-                        'eval_cost': eval_step_cost / self._logging_freq,
+                        'eval_cost': eval_cost / self._logging_freq,
                     }
                     self._module.validation_step_end(log_dict)
 
-                if self._save_steps > 0 and step % self._save_steps == 0:
+                    if paddle.distributed.get_rank() == 1:
+                        self._module.model.train()
+
+                if self._save_steps > 0 and step % self._save_steps == 0 and paddle.distributed.get_rank() == 1:
                     paddle.device.cuda.synchronize()
                     self.save(epoch=epoch_index, step=step)
             else:
                 skip_first = False
 
             if self._run_mode == 'step' and step >= self._max_steps:
+                logger.info("The training process is complete.")
                 return
 
             if self.profiler:
@@ -368,53 +372,50 @@ class EagerEngine(BasicEngine):
             valid_data_loader(DataLoader, None): a collection of :class:`paddle.io.DataLoader`, specifying validation samples.
 
         """
-        self._module.model.train()
+        if paddle.distributed.get_rank() == 0:
+            self._module.model.eval()
+        else:
+            self._module.model.train()
 
-        train_start = get_timestamp()
+        train_cost = 0.0
+        train_start = time.time()
 
         start_epoch = self._load_recovery['epoch']
         if self._load_recovery['rng_state'] != -1:
             paddle.set_cuda_rng_state(self._load_recovery['rng_state'])
 
         for epoch_index in range(start_epoch, epoch):
-            train_epoch_start = get_timestamp()
             self._train_one_epoch(epoch_index, train_data_loader,
                                   valid_data_loader)
 
-            train_epoch_cost = get_timestamp() - train_epoch_start
+            paddle.device.cuda.synchronize()
+            train_cost += time.time() - train_start
             log_dict = {
                 'epoch': epoch_index,
-                'train_cost': train_epoch_cost,
+                'train_cost': train_cost,
             }
             self._module.training_epoch_end(log_dict)
 
-            if self._lr_scheduler is not None and self._lr_scheduler_mode == 'epoch':
-                self._lr_scheduler.step()
-
+            eval_start = time.time()
             if self._run_mode == 'epoch' and self._eval_freq > 0 and \
                 epoch_index % self._eval_freq == 0:
-                eval_epoch_start = get_timestamp()
                 self._evaluate_one_epoch(epoch_index, valid_data_loader)
-                eval_epoch_cost = get_timestamp() - eval_epoch_start
+                if paddle.distributed.get_rank() == 1:
+                    self._module.model.train()
+                eval_cost = time.time() - eval_start
                 log_dict = {
                     'epoch': epoch_index,
-                    'eval_cost': eval_epoch_cost,
+                    'eval_cost': eval_cost,
                 }
                 self._module.validation_epoch_end(log_dict)
 
             if self._save_epoch > 0 and self._run_mode == 'epoch' and epoch_index % self._save_epoch == 0:
                 self.save(epoch=epoch_index, step=len(train_data_loader))
 
-        logger.info(
-            "The training process is complete and total cost of time for training is : {}".
-            format(convert_timestamp_to_data(get_timestamp() - train_start)))
-
         if self.profiler:
             self._profiler_done()
 
     def _fit_impl(self, batch):
-        self._module.model.train()
-
         batch = self._module.pretreating_batch(batch)
         if self._pp_degree == 1:
             if self._use_recompute and isinstance(self._module.model,
@@ -430,18 +431,19 @@ class EagerEngine(BasicEngine):
                                           self._dp_group)
             else:
                 loss = self._model_forward_backward(batch)
+            if paddle.distributed.get_rank() == 1:
+                self._optim_update_params()
         else:
             with paddle.amp.auto_cast(
                     self._use_pure_fp16,
                     custom_black_list=self._custom_black_list,
                     custom_white_list=self._custom_white_list,
                     level='O2'):
-                batch = self._module.model._prepare_training(
-                    batch, self._optimizer, self._lr_scheduler)
-                loss = self._module.model.forward_backward_pipeline(
-                    batch, self._scaler)
-
-        self._optim_update_params()
+                loss = self._module.model.train_batch(
+                    batch,
+                    optimizer=self._optimizer,
+                    lr_scheduler=self._lr_scheduler,
+                    scaler=self._scaler)
         return loss
 
     def _model_forward_backward(self, batch):
@@ -464,45 +466,40 @@ class EagerEngine(BasicEngine):
                     level='O2'):
                 loss = self._module.training_step(micro_batch)
 
+        if paddle.distributed.get_rank() == 1:
             loss_bw = self._scaler.scale(loss) if self._use_pure_fp16 else loss
-            if self._accumulate_steps > 1:
-                # div the loss for backward
-                loss_bw = loss_bw / self._accumulate_steps
-
-            # NOTE(haohongxiang): To temporarily resolve the problem of INF caused 
-            # by primary sharding strategy during training. The division will be removed 
-            # after fixing sharding strategy.
-            if self._distributed and self._sharding_stage == 2:
-                self._module.backward(loss_bw / self._sharding_group.nranks)
-            else:
-                self._module.backward(loss_bw)
-
-            detach_loss = loss.detach()
-            if final_loss is None:
-                final_loss = detach_loss
-            else:
-                final_loss = paddle.add(final_loss, detach_loss)
+            self._module.backward(loss_bw)
+        detach_loss = loss.detach()
+        if final_loss is None:
+            final_loss = detach_loss
+        else:
+            final_loss = paddle.add(final_loss, detach_loss)
         if self._accumulate_steps > 1:
-            # div the loss for print
             final_loss = final_loss / self._accumulate_steps
         return final_loss
 
     def _optim_update_params(self):
-        if self._sharding_stage in [3] and self._dp_degree > 1:
+        if self._sharding_stage in [2, 3] and self._dp_degree > 1:
             fused_allreduce_gradients(self._module.model.parameters(),
                                       self._hcg)
-
-            for p in self._module.model.parameters():
-                if hasattr(p, "bw_storage"):
-                    assert p.grad is None, "This case shouldn't happen."
-                    p.bw_storage.scale_(1.0 / self._dp_group.nranks)
-                    dist.all_reduce(p.bw_storage, group=self._dp_group)
+            if self._sharding_stage == 3:
+                for p in self._module.model.parameters():
+                    if hasattr(p, "bw_storage"):
+                        assert p.grad is None, "This case shouldn't happen."
+                        p.bw_storage.scale_(1.0 / self._dp_group.nranks)
+                        dist.all_reduce(p.bw_storage, group=self._dp_group)
 
         if self._use_pure_fp16:
             self._scaler.step(self._optimizer)
             self._scaler.update()
         else:
             self._optimizer.step()
+
+        if self._lr_scheduler is not None:
+            self._lr_scheduler.step()
+
+
+        self._optimizer.clear_grad()
 
     @paddle.no_grad()
     def evaluate(self, epoch=1, valid_data_loader=None):
@@ -518,14 +515,17 @@ class EagerEngine(BasicEngine):
         """
         self._module.model.eval()
 
+        eval_cost = 0.0
+        eval_epoch_start = time.time()
+
         for epoch_index in range(epoch):
-            eval_epoch_start = get_timestamp()
             self._evaluate_one_epoch(epoch_index, valid_data_loader)
 
-            eval_epoch_cost = get_timestamp() - eval_epoch_start
+            paddle.device.cuda.synchronize()
+            eval_cost += time.time() - eval_epoch_start
             log_dict = {
                 'epoch': epoch_index,
-                'eval_cost': eval_epoch_cost,
+                'eval_cost': eval_cost,
             }
             self._module.validation_epoch_end(log_dict)
 
@@ -535,27 +535,27 @@ class EagerEngine(BasicEngine):
 
     @paddle.no_grad()
     def _evaluate_one_epoch(self, epoch=1, valid_data_loader=None):
-        self._module.model.eval()
-
-        eval_step_start = get_timestamp()
+        eval_start = time.time()
         eval_losses = []
         total_eval_batch = len(valid_data_loader)
         for eval_step, batch in enumerate(valid_data_loader):
             loss = self._evaluate_impl(batch)
+
+            paddle.device.cuda.synchronize()
+            eval_cost = time.time() - eval_start
             eval_losses.append(loss.numpy()[0])
 
             if eval_step % self._logging_freq == 0:
-                eval_step_cost = get_timestamp() - eval_step_start
                 log_dict = {
                     'loss': sum(eval_losses) / len(eval_losses),
                     'epoch': epoch,
                     'batch': eval_step,
                     'total_batch': total_eval_batch,
-                    'eval_cost': eval_step_cost
-                    if eval_step == 0 else eval_step_cost / self._logging_freq,
+                    'eval_cost': eval_cost
+                    if eval_step == 0 else eval_cost / self._logging_freq,
                 }
                 self._module.validation_step_end(log_dict)
-                eval_step_start = get_timestamp()
+                eval_start = time.time()
                 eval_losses = []
 
             if self._run_mode == 'step' and eval_step >= self._max_steps:
@@ -565,9 +565,8 @@ class EagerEngine(BasicEngine):
 
     @paddle.no_grad()
     def _evaluate_impl(self, batch):
-        self._module.model.eval()
-
         batch = self._module.pretreating_batch(batch)
+
         with paddle.amp.auto_cast(
                 self._use_pure_fp16,
                 custom_black_list=self._custom_black_list,
@@ -594,15 +593,16 @@ class EagerEngine(BasicEngine):
         """
         self._module.model.eval()
 
-        test_start = get_timestamp()
+        test_start = time.time()
         test_losses = []
         for test_step, batch in enumerate(test_data_loader):
             loss = self._predict_impl(batch)
 
+            paddle.device.cuda.synchronize()
+            test_cost = time.time() - test_start
             test_losses.append(loss.numpy()[0])
 
             if test_step % self._logging_freq == 0:
-                test_cost = get_timestamp() - test_start
                 log_dict = {
                     'loss': sum(test_losses) / len(test_losses),
                     'epoch': epoch,
@@ -611,7 +611,7 @@ class EagerEngine(BasicEngine):
                     if test_step == 0 else test_cost / self._logging_freq,
                 }
                 self._module.test_step_end(log_dict)
-                test_start = get_timestamp()
+                test_start = time.time()
                 test_losses = []
 
             if test_step >= self._max_steps:
@@ -621,7 +621,6 @@ class EagerEngine(BasicEngine):
 
     @paddle.no_grad()
     def _predict_impl(self, batch):
-        self._module.model.eval()
         batch = self._module.pretreating_batch(batch)
 
         with paddle.amp.auto_cast(
@@ -644,6 +643,9 @@ class EagerEngine(BasicEngine):
             logger.info("DP_Rank %d doesn't save model" % self._dp_rank)
             return
 
+        if paddle.distributed.get_rank() == 0: 
+            return
+
         if self._output_dir and isinstance(self._output_dir, str):
             output_dir = os.path.join(self._output_dir,
                                       "epoch_%d_step_%d" % (epoch, step))
@@ -651,9 +653,10 @@ class EagerEngine(BasicEngine):
                 os.makedirs(output_dir, exist_ok=True)
             logger.info("Save model to %s" % output_dir)
 
-            save_dir = "{}/mp_{:0>2d}_sharding_{:0>2d}_pp_{:0>2d}".format(
-                output_dir, self._mp_rank, self._sharding_rank,
-                self._pp_rank) if self._distributed else output_dir
+            # save_dir = "{}/mp_{:0>2d}_sharding_{:0>2d}_pp_{:0>2d}".format(
+            #     output_dir, self._mp_rank, self._sharding_rank,
+            #     self._pp_rank) if self._distributed else output_dir
+            save_dir = output_dir
 
             if self._sharding_stage == 3:
                 self._module.model.get_all_parameters(convert2cpu=False)
@@ -669,10 +672,6 @@ class EagerEngine(BasicEngine):
             }
             paddle.save(meta_dict, os.path.join(save_dir, "meta_state.pdopt"))
 
-            save_auto_dir = os.path.join(output_dir, "auto_infer")
-            save_for_auto_inference(
-                os.path.join(save_auto_dir, "auto"), self._module.model)
-
         else:
             raise TypeError("`save` requires a valid value of `output_dir`.")
 
@@ -680,54 +679,45 @@ class EagerEngine(BasicEngine):
         """
         load the saved checkpoint file and update the state dicts of model and optimizer.
         """
+        if self.mode == 'train':
+            if paddle.distributed.get_rank() == 0 :
+                #self._ckpt_dir = 'pretrain_model/'
+                self._ckpt_dir = '/workspace/distill-gpt/'
+            elif paddle.distributed.get_rank() == 1:
+                self._ckpt_dir = 'PaddleFleetX_GPT_345M_220826/'
+        
         if self._ckpt_dir and isinstance(self._ckpt_dir, str):
             logger.info("Try to load checkpoint from %s " % self._ckpt_dir)
-
-            load_dir = "{}/mp_{:0>2d}_sharding_{:0>2d}_pp_{:0>2d}".format(
-                self._ckpt_dir, self._mp_rank, self._sharding_rank,
-                self._pp_rank) if self._distributed else self._ckpt_dir
+            load_dir = self._ckpt_dir
             model_path = os.path.join(load_dir, "model.pdparams")
-            opt_path = os.path.join(load_dir, "model_state.pdopt")
-            meta_path = os.path.join(load_dir, "meta_state.pdopt")
 
             if os.path.exists(model_path):
                 model_dict = paddle.load(model_path)
                 for name, param in self._module.model.state_dict().items():
+                    if name == 'gpt.linear.weight' or name == 'gpt.linear.bias':
+                        continue
+
+                    print('trying to load {}'.format(name))
                     assert name in model_dict.keys(
                     ), "No param named `{}` was found in checkpoint file.".format(
                         name)
-
                     if param.dtype != model_dict[name].dtype:
                         model_dict[name] = model_dict[name].cast(param.dtype)
-
+                    print("load: {}".format(name))
                 self._module.model.set_state_dict(model_dict)
             else:
                 raise ValueError("No optimizer checkpoint file found in %s." %
                                  model_path)
-
-            if self.mode == 'train':
-                if os.path.exists(opt_path):
-                    opt_dict = paddle.load(opt_path)
-                    self._optimizer.set_state_dict(opt_dict)
-                else:
-                    raise ValueError(
-                        "No optimizer checkpoint file found in %s." % opt_path)
-
-                if os.path.exists(meta_path):
-                    meta_dict = paddle.load(meta_path)
-                    self._load_recovery = {
-                        'step': meta_dict['step'],
-                        'epoch': meta_dict['epoch'],
-                        'rng_state': meta_dict['cuda_rng_state']
-                    }
-                else:
-                    raise ValueError("No meta checkpoint file found in %s." %
-                                     meta_path)
-
             logger.info("successfully load checkpoints")
         else:
             logger.warning("`load` requires a valid value of `ckpt_dir`.")
             raise TypeError("`load` requires a valid value of `ckpt_dir`.")
+
+        info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
+
+        print("Total memory:", info.total/1024**3, "GB")
+        print("Free memory:", info.free/1024**3, "GB")
+        print("Used memory:", info.used/1024**3, "GB")
 
     def export(self):
         self._module.model.eval()
@@ -735,31 +725,14 @@ class EagerEngine(BasicEngine):
 
         save_dir = os.path.join(self._output_dir,
                                 "rank_{}".format(self._dp_rank))
-
-        if not self._quant_mode:
-            export_inference_model(self._module.model, input_spec, save_dir,
-                                   'model')
-        else:
-            logger.info("export quantized model.")
-            export_inference_model(
-                self._module.model,
-                input_spec,
-                save_dir,
-                'model',
-                export_quant_model=True,
-                quanter=self._module.quanter)
+        export_inference_model(self._module.model, input_spec, save_dir,
+                               'model')
 
     def inference(self, data):
         if self._inference_engine is None:
-            # parse TensorRT config
-            tensorrt_config = None
-            if 'TensorRT' in self._inference_configs:
-                tensorrt_config = TensorRTConfig(
-                    **self._inference_configs['TensorRT'])
-
             self._inference_engine = InferenceEngine(
                 self._inference_configs['model_dir'],
-                self._inference_configs['mp_degree'], tensorrt_config)
+                self._inference_configs['mp_degree'])
 
         return self._inference_engine.predict(data)
 
