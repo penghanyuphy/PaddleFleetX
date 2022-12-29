@@ -172,6 +172,10 @@ class EagerEngine(BasicEngine):
 
         self._use_recompute = configs['Model']['use_recompute']
 
+        self._distill_mode = True if 'Distillation' in configs['Compress'] and configs['Compress'][
+            'Distillation']['enable'] else False
+        self._distill_student_update = self._distill_mode is False or (self._distill_mode is True and paddle.distributed.get_rank() == 1)
+
         if self._use_pure_fp16:
             if mode == 'train':
                 self._scaler = paddle.amp.GradScaler(
@@ -184,19 +188,29 @@ class EagerEngine(BasicEngine):
         else:
             self._scaler = None
 
-        self._lr_scheduler_mode = configs.Optimizer.lr.pop('run_mode', 'step')
-        assert self._lr_scheduler_mode in [
-            'epoch', 'step'
-        ], 'lr.run_mode must be epoch or step'
+        if mode == 'train':
+            self._lr_scheduler_mode = configs.Optimizer.lr.pop('run_mode', 'step')
+            assert self._lr_scheduler_mode in [
+                'epoch', 'step'
+            ], 'lr.run_mode must be epoch or step'
         self._lr_scheduler = build_lr_scheduler(
             configs.Optimizer.lr) if mode == 'train' else None
-
+        
         self._optimizer = build_optimizer(
             configs.Optimizer, self._module.model,
             self._lr_scheduler) if mode == 'train' else None
-
+        
         # distributed configs
         self._distributed = (dist.get_world_size() > 1)
+          
+        #NOTE(penghanyuphy): In distillation mode, two cards are used to run the 
+        #teacher and student network respectively. But this case is nothing about 
+        #distributed training, so we set self._distributed to False  
+        if self._distill_mode is True:
+            self.teacher_ckpt_dir = self._module.configs['Compress']['Distillation']['Teacher']['save_load']['ckpt_dir']
+            self._ckpt_dir = self._compress_configs['pretrained']
+            self._distributed = False
+            self.load()
 
         if self._distributed:
             self._hcg = env.get_hcg()
@@ -355,9 +369,14 @@ class EagerEngine(BasicEngine):
                         'eval_cost': eval_step_cost / self._logging_freq,
                     }
                     self._module.validation_step_end(log_dict)
+                    
+                    if self._distill_student_update:
+                        self._module.model.train()
 
                 if self._save_steps > 0 and step % self._save_steps == 0:
-                    device_synchronize()
+                    if  self._distill_student_update:
+                        device_synchronize()
+
                     self.save(epoch=epoch_index, step=step)
             else:
                 skip_first = False
@@ -381,7 +400,11 @@ class EagerEngine(BasicEngine):
             valid_data_loader(DataLoader, None): a collection of :class:`paddle.io.DataLoader`, specifying validation samples.
 
         """
-        self._module.model.train()
+
+        if self._distill_student_update:
+            self._module.model.train()
+        else:
+            self._module.model.eval()
 
         train_start = get_timestamp()
 
@@ -454,7 +477,9 @@ class EagerEngine(BasicEngine):
                 loss = self._module.model.forward_backward_pipeline(
                     batch, self._scaler)
 
-        self._optim_update_params()
+        if self._distill_student_update:
+            self._optim_update_params()
+
         return loss
 
     def _model_forward_backward(self, batch):
@@ -477,7 +502,9 @@ class EagerEngine(BasicEngine):
                     level='O2'):
                 loss = self._module.training_step(micro_batch)
 
-            loss_bw = self._scaler.scale(loss) if self._use_pure_fp16 else loss
+            if self._distill_student_update:
+                loss_bw = self._scaler.scale(loss) if self._use_pure_fp16 else loss
+            
             if self._accumulate_steps > 1:
                 # div the loss for backward
                 loss_bw = loss_bw / self._accumulate_steps
@@ -488,7 +515,8 @@ class EagerEngine(BasicEngine):
             if self._distributed and self._sharding_stage == 2:
                 self._module.backward(loss_bw / self._sharding_group.nranks)
             else:
-                self._module.backward(loss_bw)
+                if self._distill_student_update:
+                    self._module.backward(loss_bw)
 
             detach_loss = loss.detach()
             if final_loss is None:
@@ -656,6 +684,9 @@ class EagerEngine(BasicEngine):
         if self._dp_rank != 0:
             logger.info("DP_Rank %d doesn't save model" % self._dp_rank)
             return
+        
+        if self._distill_mode is True and paddle.distributed.get_rank() == 0:
+            return
 
         if self._output_dir and isinstance(self._output_dir, str):
             output_dir = os.path.join(self._output_dir,
@@ -682,9 +713,10 @@ class EagerEngine(BasicEngine):
             }
             paddle.save(meta_dict, os.path.join(save_dir, "meta_state.pdopt"))
 
-            save_auto_dir = os.path.join(output_dir, "auto_infer")
-            save_for_auto_inference(
-                os.path.join(save_auto_dir, "auto"), self._module.model)
+            if self._distill_mode is False:
+                save_auto_dir = os.path.join(output_dir, "auto_infer")
+                save_for_auto_inference(
+                    os.path.join(save_auto_dir, "auto"), self._module.model)
 
         else:
             raise TypeError("`save` requires a valid value of `output_dir`.")
@@ -710,6 +742,9 @@ class EagerEngine(BasicEngine):
         """
         load the saved checkpoint file and update the state dicts of model and optimizer.
         """
+        if self._distill_mode is True and paddle.distributed.get_rank() == 0:
+            self._ckpt_dir = self.teacher_ckpt_dir
+
         if self._ckpt_dir and isinstance(self._ckpt_dir, str):
             logger.info("Try to load checkpoint from %s " % self._ckpt_dir)
 
@@ -735,7 +770,7 @@ class EagerEngine(BasicEngine):
                 raise ValueError("No optimizer checkpoint file found in %s." %
                                  model_path)
 
-            if self.mode == 'train':
+            if self.mode == 'train' and self._distill_mode is False:
                 if os.path.exists(opt_path):
                     opt_dict = paddle.load(opt_path)
                     self._optimizer.set_state_dict(opt_dict)

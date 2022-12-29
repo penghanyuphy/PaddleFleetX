@@ -70,6 +70,14 @@ class GPTDataset(paddle.io.Dataset):
 
         device_world_size = paddle.distributed.get_world_size()
 
+        try:
+            distill_mode = int(os.getenv("DISTILL_MODE"))
+        except Exception as e:
+            distill_mode = 0
+
+        if distill_mode == 1:
+            device_world_size = 1
+
         if device_world_size > 1 and local_rank != 0:
             while True:
                 try:

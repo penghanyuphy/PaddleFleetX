@@ -45,7 +45,12 @@ if __name__ == "__main__":
     args = config.parse_args()
     cfg = config.get_config(args.config, overrides=args.override, show=False)
 
-    if dist.get_world_size() > 1:
+    if "DISTILL_MODE" in os.environ:
+        distill_mode = int(os.getenv("DISTILL_MODE"))
+    else:
+        distill_mode = 0
+    
+    if distill_mode==0 and dist.get_world_size() > 1:
         env.init_dist_env(cfg)
 
     env.set_seed(cfg.Global.seed)
@@ -63,6 +68,8 @@ if __name__ == "__main__":
     })
 
     engine = EagerEngine(configs=cfg, module=module)
+
+    engine.compress_model()
 
     if cfg.Engine.save_load.ckpt_dir is not None:
         engine.load()
